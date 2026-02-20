@@ -147,10 +147,15 @@ const server = http.createServer((req, res) => {
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ agents, conversation }));
+  } else if (req.url === '/' || req.url === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(HTML);
   } else {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(HTML);
   }
 });
+
+server.on('error', (e) => console.error('Server error:', e.message));
 
 server.listen(PORT, () => console.log(`MicroAgent Viewer: http://localhost:${PORT}`));

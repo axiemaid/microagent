@@ -465,7 +465,11 @@ async function loop(wallet, state) {
           }
           reply = skill.strip(reply);
         }
-        reply = reply.substring(0, 100);
+        // Append transfer receipt to reply text
+        if (extraSats > 0) {
+          reply = reply ? `${reply} [sent ${extraSats} sats ✓]` : `[sent ${extraSats} sats ✓]`;
+        }
+        reply = reply.substring(0, 150); // allow slightly longer for receipt
         if (extraSats > 0) log(`SENDING: ${extraSats} extra sats to ${msg.sender} in reply tx`);
         log(`REPLYING: "${reply}"`);
         try {
