@@ -431,12 +431,17 @@ async function loop(wallet, state) {
       const skillPrompts = SKILLS.map(s => s.prompt()).filter(Boolean).join('\n');
       const skillSection = skillPrompts ? `\nAvailable commands:\n${skillPrompts}\n` : '';
 
+      // Load persona if exists
+      const personaPath = path.join(HOME, 'persona.txt');
+      const persona = fs.existsSync(personaPath) ? fs.readFileSync(personaPath, 'utf8').trim() : '';
+      const basePrompt = persona || `You are MicroAgent, a minimal autonomous agent living on the BSV blockchain.`;
+
       const response = await think(
-        `You are MicroAgent, a minimal autonomous agent living on the BSV blockchain. Address: ${wallet.address}. Balance: ${balance} sats. You communicate only through on-chain transactions.\n` +
+        `${basePrompt}\nAddress: ${wallet.address}. Balance: ${balance} sats. You communicate only through on-chain transactions.\n` +
         skillSection +
         contextStr +
         `\nNew message from ${sender}:\n"${text}"\n\n` +
-        `Reply briefly (under 100 chars, every byte costs sats). Be direct. Continue the conversation naturally if there's history.`
+        `Reply briefly (under 100 chars, every byte costs sats). Be direct.`
       );
 
       if (response && balance > 1000) {
