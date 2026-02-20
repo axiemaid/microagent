@@ -1,26 +1,26 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * Send an on-chain message to MicroAgent from our main wallet.
- * Usage: node send-msg.cjs <message>
- * 
+ * Send an on-chain message to any MicroAgent.
+ * Usage: node send-msg.cjs --wallet <wallet.json> --to <address> "message"
+ *
  * Sends 1000 sats + OP_RETURN with MA1 protocol prefix.
  */
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
 const bsv = require('bsv');
 
-const MAIN_WALLET = path.join(require('os').homedir(), '.openclaw', 'bsv-wallet.json');
-const AGENT_WALLET = path.join(require('os').homedir(), '.openclaw', 'microagent', 'wallet.json');
 const WOC = 'https://api.whatsonchain.com/v1/bsv/main';
 const PREFIX = 'MA1';
-const SEND_AMOUNT = 1000; // sats to send with message
+const SEND_AMOUNT = 1000;
 
 function httpGet(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'microagent-msg/1.0' } }, (res) => {
+    const mod = url.startsWith('https') ? https : http;
+    mod.get(url, { headers: { 'User-Agent': 'microagent-msg/1.0' } }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
@@ -34,9 +34,11 @@ function httpGet(url) {
 function httpPost(url, body) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
+    const mod = url.startsWith('https') ? https : http;
     const payload = JSON.stringify(body);
-    const req = https.request({
-      hostname: parsed.hostname, path: parsed.pathname, method: 'POST',
+    const req = mod.request({
+      hostname: parsed.hostname, port: parsed.port || (url.startsWith('https') ? 443 : 80),
+      path: parsed.pathname, method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
     }, (res) => {
       let data = '';
@@ -49,18 +51,36 @@ function httpPost(url, body) {
   });
 }
 
+function usage() {
+  console.error('Usage: node send-msg.cjs --wallet <wallet.json> --to <address> "message"');
+  console.error('  --wallet  Path to sender wallet.json (wif + address)');
+  console.error('  --to      Recipient BSV address');
+  process.exit(1);
+}
+
 async function main() {
-  const message = process.argv.slice(2).join(' ');
-  if (!message) { console.error('Usage: node send-msg.cjs <message>'); process.exit(1); }
+  const args = process.argv.slice(2);
+  let walletPath = null;
+  let toAddress = null;
+  const msgParts = [];
 
-  const mainW = JSON.parse(fs.readFileSync(MAIN_WALLET, 'utf8'));
-  const agentW = JSON.parse(fs.readFileSync(AGENT_WALLET, 'utf8'));
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--wallet' && args[i + 1]) { walletPath = args[++i]; continue; }
+    if (args[i] === '--to' && args[i + 1]) { toAddress = args[++i]; continue; }
+    msgParts.push(args[i]);
+  }
 
-  const privKey = bsv.PrivKey.fromWif(mainW.wif);
+  const message = msgParts.join(' ');
+  if (!walletPath || !toAddress || !message) usage();
+
+  walletPath = path.resolve(walletPath);
+  if (!fs.existsSync(walletPath)) { console.error(`Wallet not found: ${walletPath}`); process.exit(1); }
+
+  const w = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
+  const privKey = bsv.PrivKey.fromWif(w.wif);
   const keyPair = bsv.KeyPair.fromPrivKey(privKey);
 
-  // Get UTXOs
-  const utxos = await httpGet(`${WOC}/address/${mainW.address}/unspent`);
+  const utxos = await httpGet(`${WOC}/address/${w.address}/unspent`);
   if (!utxos.length) { console.error('No UTXOs'); process.exit(1); }
 
   const tx = new bsv.Tx();
@@ -77,7 +97,6 @@ async function main() {
     if (inputSats > SEND_AMOUNT + 5000) break;
   }
 
-  // OP_RETURN: MA1 | msg | <message text>
   const opScript = new bsv.Script();
   opScript.writeOpCode(bsv.OpCode.OP_FALSE);
   opScript.writeOpCode(bsv.OpCode.OP_RETURN);
@@ -86,16 +105,13 @@ async function main() {
   opScript.writeBuffer(Buffer.from(message, 'utf8'));
   tx.addTxOut(new bsv.Bn(0), opScript);
 
-  // Payment to agent
-  tx.addTxOut(new bsv.Bn(SEND_AMOUNT), bsv.Address.fromString(agentW.address).toTxOutScript());
+  tx.addTxOut(new bsv.Bn(SEND_AMOUNT), bsv.Address.fromString(toAddress).toTxOutScript());
 
-  // Change
   const fee = Math.ceil((200 + message.length + 34 * 2) * 0.5);
   const change = inputSats - SEND_AMOUNT - fee;
   if (change < 0) { console.error('Insufficient funds'); process.exit(1); }
-  tx.addTxOut(new bsv.Bn(change), bsv.Address.fromString(mainW.address).toTxOutScript());
+  tx.addTxOut(new bsv.Bn(change), bsv.Address.fromString(w.address).toTxOutScript());
 
-  // Sign
   for (let i = 0; i < inputTxOuts.length; i++) {
     const sig = tx.sign(keyPair, bsv.Sig.SIGHASH_ALL | bsv.Sig.SIGHASH_FORKID, i, inputTxOuts[i].script, inputTxOuts[i].valueBn);
     const scriptSig = new bsv.Script();
@@ -106,8 +122,9 @@ async function main() {
 
   const result = await httpPost(`${WOC}/tx/raw`, { txhex: tx.toHex() });
   const txid = Buffer.from(tx.hash()).reverse().toString('hex');
-  console.log(`✉️  Message sent to MicroAgent`);
-  console.log(`To: ${agentW.address}`);
+  console.log(`✉️  Message sent`);
+  console.log(`From: ${w.address}`);
+  console.log(`To: ${toAddress}`);
   console.log(`Amount: ${SEND_AMOUNT} sats`);
   console.log(`Message: "${message}"`);
   console.log(`TXID: ${txid}`);

@@ -7,27 +7,58 @@ const https = require('https');
 const http = require('http');
 const bsv = require('bsv');
 
-// === PATHS ===
-const HOME = path.join(require('os').homedir(), '.openclaw', 'microagent');
-const WALLET_PATH = path.join(HOME, 'wallet.json');
-const STATE_PATH = path.join(HOME, 'state.json');
-const CONFIG_PATH = path.join(HOME, 'config.json');
-const LOG_PATH = path.join(HOME, 'microagent.log');
-const SKILLS_DIR = path.join(HOME, 'skills');
+// === RESOLVE AGENT DIR ===
+function resolveAgentDir() {
+  const idx = process.argv.indexOf('--agent-dir');
+  if (idx !== -1 && process.argv[idx + 1]) {
+    return path.resolve(process.argv[idx + 1]);
+  }
+  // Fallback: current working directory
+  return process.cwd();
+}
+
+const AGENT_DIR = resolveAgentDir();
+const REPO_DIR = path.resolve(__dirname);
+
+const WALLET_PATH = path.join(AGENT_DIR, 'wallet.json');
+const STATE_PATH = path.join(AGENT_DIR, 'state.json');
+const CONFIG_PATH = path.join(AGENT_DIR, 'config.json');
+const LOG_PATH = path.join(AGENT_DIR, 'microagent.log');
+const REPO_SKILLS_DIR = path.join(REPO_DIR, 'skills');
+const AGENT_SKILLS_DIR = path.join(AGENT_DIR, 'skills');
 
 // === SKILLS ===
 function loadSkills() {
   const skills = [];
-  if (!fs.existsSync(SKILLS_DIR)) return skills;
-  for (const file of fs.readdirSync(SKILLS_DIR)) {
-    if (!file.endsWith('.cjs')) continue;
-    try {
-      const skill = require(path.join(SKILLS_DIR, file));
-      skills.push(skill);
-    } catch (e) {
-      console.error(`Failed to load skill ${file}: ${e.message}`);
+  const loaded = new Set();
+
+  // Load from agent-specific skills dir first (overrides)
+  if (fs.existsSync(AGENT_SKILLS_DIR)) {
+    for (const file of fs.readdirSync(AGENT_SKILLS_DIR)) {
+      if (!file.endsWith('.cjs')) continue;
+      try {
+        const skill = require(path.join(AGENT_SKILLS_DIR, file));
+        skills.push(skill);
+        loaded.add(file);
+      } catch (e) {
+        console.error(`Failed to load agent skill ${file}: ${e.message}`);
+      }
     }
   }
+
+  // Load from repo skills dir (skip if already loaded from agent dir)
+  if (fs.existsSync(REPO_SKILLS_DIR)) {
+    for (const file of fs.readdirSync(REPO_SKILLS_DIR)) {
+      if (!file.endsWith('.cjs') || loaded.has(file)) continue;
+      try {
+        const skill = require(path.join(REPO_SKILLS_DIR, file));
+        skills.push(skill);
+      } catch (e) {
+        console.error(`Failed to load skill ${file}: ${e.message}`);
+      }
+    }
+  }
+
   return skills;
 }
 
@@ -35,20 +66,24 @@ const SKILLS = loadSkills();
 
 // === CONFIG ===
 const DEFAULT_CONFIG = {
-  loopIntervalMs: 60000,
+  llmEndpoint: 'http://localhost:11434',
+  llmModel: 'qwen3:8b',
   feeRate: 0.5,
+  loopIntervalMs: 60000,
   protocolPrefix: 'MA1',
-  ollama: {
-    model: 'llama3.2:3b',
-    url: 'http://localhost:11434'
-  }
+  httpTimeout: 15000,
 };
 
 function loadConfig() {
   if (fs.existsSync(CONFIG_PATH)) {
-    return { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) };
+    const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    // Support legacy ollama.* format
+    if (raw.ollama) {
+      if (!raw.llmEndpoint && raw.ollama.url) raw.llmEndpoint = raw.ollama.url;
+      if (!raw.llmModel && raw.ollama.model) raw.llmModel = raw.ollama.model;
+    }
+    return { ...DEFAULT_CONFIG, ...raw };
   }
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
   return DEFAULT_CONFIG;
 }
 
@@ -72,6 +107,7 @@ function initWallet() {
   const keyPair = bsv.KeyPair.fromPrivKey(privKey);
   const address = bsv.Address.fromPubKey(keyPair.pubKey).toString();
   const wallet = { wif: privKey.toWif(), address };
+  fs.mkdirSync(AGENT_DIR, { recursive: true });
   fs.writeFileSync(WALLET_PATH, JSON.stringify(wallet, null, 2));
   log(`NEW WALLET CREATED: ${address}`);
   return { privKey, keyPair, address, wif: wallet.wif };
@@ -85,7 +121,8 @@ function loadState() {
 function saveState(state) { fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2)); }
 
 // === HTTP ===
-function httpGet(url, timeoutMs = 15000) {
+function httpGet(url, timeoutMs) {
+  timeoutMs = timeoutMs || CONFIG.httpTimeout;
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.get(url, { headers: { 'User-Agent': 'microagent/1.0' }, timeout: timeoutMs }, (res) => {
@@ -155,10 +192,8 @@ function parseOpReturn(tx) {
     const hex = out.scriptPubKey?.hex;
     if (!hex) continue;
     try {
-      // Parse hex manually — find data pushes after OP_RETURN
       const buf = Buffer.from(hex, 'hex');
       let i = 0;
-      // Skip to after OP_RETURN (0x6a) or OP_FALSE OP_RETURN (0x00 0x6a)
       while (i < buf.length) {
         if (buf[i] === 0x6a) { i++; break; }
         i++;
@@ -167,8 +202,8 @@ function parseOpReturn(tx) {
       while (i < buf.length) {
         let len = buf[i]; i++;
         if (len === 0) continue;
-        if (len === 0x4c) { len = buf[i]; i++; }        // OP_PUSHDATA1
-        else if (len === 0x4d) { len = buf.readUInt16LE(i); i += 2; } // OP_PUSHDATA2
+        if (len === 0x4c) { len = buf[i]; i++; }
+        else if (len === 0x4d) { len = buf.readUInt16LE(i); i += 2; }
         if (i + len > buf.length) break;
         parts.push(buf.slice(i, i + len).toString('utf8'));
         i += len;
@@ -183,13 +218,10 @@ function parseOpReturn(tx) {
 
 function getSender(tx) {
   if (!tx.vin || !tx.vin[0]) return null;
-  // Try direct addr field first
   if (tx.vin[0].addr) return tx.vin[0].addr;
-  // Extract pubkey from scriptSig asm: "<sig> <pubkey>"
   try {
     const asm = tx.vin[0].scriptSig?.asm || '';
     const parts = asm.split(' ').filter(p => !p.startsWith('[') && !p.startsWith('OP_'));
-    // Last part should be the pubkey hex (33 bytes compressed = 66 hex chars)
     const pubKeyHex = parts[parts.length - 1];
     if (pubKeyHex && (pubKeyHex.length === 66 || pubKeyHex.length === 130)) {
       const pubKey = bsv.PubKey.fromHex(pubKeyHex);
@@ -212,13 +244,11 @@ function getAmountToAddress(tx, addr) {
 
 // === SEND OP_RETURN TX ===
 async function sendOpReturn(wallet, dataStrings, recipientAddr, extraSats = 0) {
-  const SEND_AMOUNT = recipientAddr ? (1000 + extraSats) : 0; // base 1000 + any skill extras
-  // Gather UTXOs
+  const SEND_AMOUNT = recipientAddr ? (1000 + extraSats) : 0;
   let utxos = await getUtxos(wallet.address);
   if (!utxos.length) utxos = await getUnconfirmedUtxos(wallet.address);
   if (!utxos.length) throw new Error('No UTXOs');
 
-  // Fetch raw txs for inputs
   const tx = new bsv.Tx();
   const inputTxOuts = [];
   let inputSats = 0;
@@ -234,7 +264,6 @@ async function sendOpReturn(wallet, dataStrings, recipientAddr, extraSats = 0) {
     if (inputSats > SEND_AMOUNT + 5000) break;
   }
 
-  // Build OP_RETURN output
   const opScript = new bsv.Script();
   opScript.writeOpCode(bsv.OpCode.OP_FALSE);
   opScript.writeOpCode(bsv.OpCode.OP_RETURN);
@@ -243,21 +272,17 @@ async function sendOpReturn(wallet, dataStrings, recipientAddr, extraSats = 0) {
   }
   tx.addTxOut(new bsv.Bn(0), opScript);
 
-  // Payment to recipient (so they see this tx in their UTXOs)
   if (recipientAddr) {
     tx.addTxOut(new bsv.Bn(SEND_AMOUNT), bsv.Address.fromString(recipientAddr).toTxOutScript());
   }
 
-  // Estimate fee
   const estSize = 150 + (dataStrings.join('').length) + 34 * (recipientAddr ? 2 : 1);
   const fee = Math.ceil(estSize * CONFIG.feeRate);
   const change = inputSats - SEND_AMOUNT - fee;
   if (change < 0) throw new Error(`Insufficient funds: have ${inputSats}, need ${SEND_AMOUNT + fee}`);
 
-  // Change output
   tx.addTxOut(new bsv.Bn(change), bsv.Address.fromString(wallet.address).toTxOutScript());
 
-  // Sign
   for (let i = 0; i < inputTxOuts.length; i++) {
     const sig = tx.sign(
       wallet.keyPair,
@@ -318,43 +343,36 @@ async function sendBsv(wallet, amountSats, toAddress) {
   return { txid, fee };
 }
 
-// === OLLAMA ===
+// === LLM ===
 async function think(prompt) {
   try {
-    const resp = await httpPost(`${CONFIG.ollama.url}/api/generate`, {
-      model: CONFIG.ollama.model,
+    const resp = await httpPost(`${CONFIG.llmEndpoint}/api/generate`, {
+      model: CONFIG.llmModel,
       prompt: prompt,
       stream: false,
-      options: { temperature: 0.9, num_predict: 600, repeat_penalty: 1.5, repeat_last_n: 256 }
+      options: { temperature: 0.9, num_predict: 1200, repeat_penalty: 1.5, repeat_last_n: 256 }
     });
-    // qwen3 puts thinking in 'thinking' field and answer in 'response'
-    // But sometimes everything ends up in 'thinking' and 'response' is empty
     let text = (resp.response || '').trim();
-    
-    // If response is empty, try to extract answer from thinking field
+
     if (!text && resp.thinking) {
       const thinking = resp.thinking.trim();
-      // Look for a quoted reply or the last sentence after reasoning
       const quotedMatch = thinking.match(/"([^"]{5,100})"/);
       if (quotedMatch) {
         text = quotedMatch[1];
       } else {
-        // Take the last sentence-like fragment
         const sentences = thinking.split(/[.!?]\s+/);
         const last = sentences[sentences.length - 1]?.trim();
         if (last && last.length > 2 && last.length < 120) text = last;
       }
     }
-    
-    // Strip think tags if they leak into response
+
     if (text.includes('</think>')) text = text.split('</think>').pop().trim();
     if (text.startsWith('<think>')) text = '';
     text = text.replace(/<\/?think>/g, '').trim();
-    // Strip LLM "thinking aloud" preambles  
     text = text.replace(/^(Okay|Alright|Let me|I need to|The user|Hmm|So|I should|I'll)[^.]*\.\s*/i, '').trim();
     return text || null;
   } catch (e) {
-    log(`OLLAMA ERROR: ${e.message}`);
+    log(`LLM ERROR: ${e.message}`);
     return null;
   }
 }
@@ -372,7 +390,6 @@ async function loop(wallet, state) {
     return;
   }
 
-  // Scan for new transactions
   const confirmed = await getUtxos(wallet.address);
   const unconfirmed = await getUnconfirmedUtxos(wallet.address);
   const allTxids = [...new Set([...confirmed, ...unconfirmed].map(u => u.tx_hash))];
@@ -381,7 +398,7 @@ async function loop(wallet, state) {
   const newMessages = [];
   for (const txid of newTxids) {
     try {
-      await sleep(1000); // rate limit — WoC is strict
+      await sleep(1000);
       const tx = await getTx(txid);
       const opReturn = parseOpReturn(tx);
       const sender = getSender(tx);
@@ -391,52 +408,43 @@ async function loop(wallet, state) {
         const msg = { txid, sender, amount, type: opReturn[0] || 'unknown', data: opReturn.slice(1), time: Date.now() };
         newMessages.push(msg);
         log(`MSG IN: from=${sender} type=${msg.type} data="${msg.data.join(' | ')}"`);
-        // Don't mark as processed yet — only after successful reply
       } else {
         if (amount > 0 && sender && sender !== wallet.address && !opReturn) {
           log(`PAYMENT IN: ${amount} sats from ${sender}`);
         }
-        state.processedTxids.push(txid); // non-message txids marked immediately
+        state.processedTxids.push(txid);
       }
     } catch (e) {
       log(`TX ERROR ${txid}: ${e.message}`);
     }
   }
 
-  // Trim state
   if (state.processedTxids.length > 1000) state.processedTxids = state.processedTxids.slice(-500);
 
-  // Respond to messages
   for (const msg of newMessages) {
     if (msg.type === 'msg' || msg.type === 'reply') {
-      // For reply type, data is [txid, ...text] — skip the txid reference
       const text = msg.type === 'reply' ? msg.data.slice(1).join(' ') : msg.data.join(' ');
       const sender = msg.sender || 'unknown';
       log(`THINKING: "${text}" (from: ${sender})`);
 
-      // Initialize conversation history for this sender
       if (!state.conversations) state.conversations = {};
       if (!state.conversations[sender]) state.conversations[sender] = [];
 
-      // Build conversation context
       const history = state.conversations[sender];
       let contextStr = '';
       if (history.length > 0) {
-        const recent = history.slice(-6); // last 6 exchanges
         contextStr = '\nConversation history with this sender:\n' +
-          recent.map(h => `${h.role}: ${h.text}`).join('\n') + '\n';
+          history.map(h => `${h.role}: ${h.text}`).join('\n') + '\n';
       }
 
-      // Build skill prompts
-      const skillPrompts = SKILLS.map(s => s.prompt()).filter(Boolean).join('\n');
+      const skillCtx = { sender, myAddress: wallet.address };
+      const skillPrompts = SKILLS.map(s => s.prompt(skillCtx)).filter(Boolean).join('\n');
       const skillSection = skillPrompts ? `\nAvailable commands:\n${skillPrompts}\n` : '';
 
-      // Load persona if exists
-      const personaPath = path.join(HOME, 'persona.txt');
+      const personaPath = path.join(AGENT_DIR, 'persona.txt');
       const persona = fs.existsSync(personaPath) ? fs.readFileSync(personaPath, 'utf8').trim() : '';
       const basePrompt = persona || `You are MicroAgent, a minimal autonomous agent living on the BSV blockchain.`;
 
-      // Build anti-repetition: collect this agent's recent replies
       const myReplies = history.filter(h => h.role === 'me').slice(-5).map(h => h.text);
       const noRepeatSection = myReplies.length > 0
         ? `\nYour recent replies (DO NOT repeat or paraphrase any of these):\n${myReplies.map(r => `- "${r}"`).join('\n')}\n`
@@ -448,23 +456,20 @@ async function loop(wallet, state) {
         contextStr +
         noRepeatSection +
         `\nNew message from ${sender}:\n"${text}"\n\n` +
-        `Reply with something NEW (under 500 chars). Never repeat yourself. Be specific — propose concrete designs, schemas, protocols, or action plans. Advance the conversation toward building something real.`
+        `Reply with something NEW (under 1000 chars). Never repeat yourself. Be specific — propose concrete designs, schemas, protocols, or action plans. Advance the conversation toward building something real.`
       );
 
       if (response && balance > 1000) {
-        // Execute skill commands from response
         let reply = response;
         let extraSats = 0;
         for (const skill of SKILLS) {
           const actions = skill.parse(reply);
           for (const action of actions) {
             log(`SKILL ${skill.name}: ${action.raw}`);
-            // For send-bsv, accumulate sats to embed in the reply tx
             if (skill.name === 'send-bsv' && action.address === msg.sender) {
               extraSats += action.amount;
               log(`SKILL ${skill.name}: +${action.amount} sats embedded in reply tx`);
             } else if (skill.name === 'send-bsv') {
-              // Sending to a third party — still needs separate tx
               const result = await skill.execute(action, { wallet, sendBsv, log });
               if (result.success) log(`SKILL ${skill.name}: sent ${action.amount} to ${action.address} (txid: ${result.txid})`);
               else log(`SKILL ${skill.name}: failed (${result.error})`);
@@ -472,23 +477,20 @@ async function loop(wallet, state) {
           }
           reply = skill.strip(reply);
         }
-        // Append transfer receipt to reply text
         if (extraSats > 0) {
           reply = reply ? `${reply} [sent ${extraSats} sats ✓]` : `[sent ${extraSats} sats ✓]`;
         }
-        reply = reply.substring(0, 500);
+        reply = reply.substring(0, 1000);
         if (extraSats > 0) log(`SENDING: ${extraSats} extra sats to ${msg.sender} in reply tx`);
         log(`REPLYING: "${reply}"`);
         try {
           const r = await sendOpReturn(wallet, [CONFIG.protocolPrefix, 'reply', msg.txid, reply], msg.sender, extraSats);
           log(`REPLY TX: ${r.txid} (fee: ${r.fee} sats)`);
-          state.processedTxids.push(msg.txid); // Mark as processed AFTER successful reply
+          state.processedTxids.push(msg.txid);
           state.actions.push({ type: 'reply', to: sender, replyTo: msg.txid, text: reply, txid: r.txid, time: Date.now() });
 
-          // Store conversation history
           state.conversations[sender].push({ role: 'them', text, time: Date.now() });
           state.conversations[sender].push({ role: 'me', text: reply, time: Date.now() });
-          // Keep max 20 entries per sender
           if (state.conversations[sender].length > 20) {
             state.conversations[sender] = state.conversations[sender].slice(-20);
           }
@@ -497,7 +499,6 @@ async function loop(wallet, state) {
         }
       } else {
         log(response ? 'BALANCE TOO LOW TO REPLY' : 'LLM UNAVAILABLE');
-        // Still record the incoming message even if we can't reply
         if (!state.conversations[sender]) state.conversations[sender] = [];
         state.conversations[sender].push({ role: 'them', text, time: Date.now() });
       }
@@ -513,14 +514,15 @@ async function loop(wallet, state) {
 // === MAIN ===
 async function main() {
   log('='.repeat(50));
-  log('MICROAGENT v0.1 STARTING');
+  log('MICROAGENT v0.2 STARTING');
+  log(`Agent dir: ${AGENT_DIR}`);
   log('='.repeat(50));
 
   const wallet = initWallet();
   const state = loadState();
 
   log(`Address: ${wallet.address}`);
-  log(`Loop: ${CONFIG.loopIntervalMs / 1000}s | Fee: ${CONFIG.feeRate} sat/byte | LLM: ${CONFIG.ollama.model}`);
+  log(`Loop: ${CONFIG.loopIntervalMs / 1000}s | Fee: ${CONFIG.feeRate} sat/byte | LLM: ${CONFIG.llmModel} @ ${CONFIG.llmEndpoint}`);
 
   process.on('SIGINT', () => { log('SHUTDOWN'); saveState(state); process.exit(0); });
   process.on('SIGTERM', () => { log('SHUTDOWN'); saveState(state); process.exit(0); });
@@ -537,18 +539,24 @@ async function main() {
 }
 
 // === CLI ===
-const cmd = process.argv[2];
+// Strip --agent-dir from argv for CLI command parsing
+const cliArgs = process.argv.slice(2).filter((a, i, arr) => a !== '--agent-dir' && arr[i - 1] !== '--agent-dir');
+const cmd = cliArgs[0];
+
 if (cmd === 'init') {
+  fs.mkdirSync(AGENT_DIR, { recursive: true });
   const w = initWallet();
+  console.log(`Agent dir: ${AGENT_DIR}`);
   console.log(`Address: ${w.address}`);
   console.log('Send BSV to this address to activate.');
 } else if (cmd === 'address') {
   if (fs.existsSync(WALLET_PATH)) console.log(JSON.parse(fs.readFileSync(WALLET_PATH, 'utf8')).address);
-  else console.log('No wallet. Run: node microagent.cjs init');
+  else console.log('No wallet. Run: node microagent.cjs --agent-dir <dir> init');
 } else if (cmd === 'status') {
   if (fs.existsSync(STATE_PATH)) {
     const s = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
     const w = JSON.parse(fs.readFileSync(WALLET_PATH, 'utf8'));
+    console.log(`Agent dir: ${AGENT_DIR}`);
     console.log(`Address:  ${w.address}`);
     console.log(`Loops:    ${s.loopCount}`);
     console.log(`Last:     ${s.lastLoop ? new Date(s.lastLoop).toISOString() : 'never'}`);

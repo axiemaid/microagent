@@ -10,83 +10,113 @@ MicroAgent polls the BSV blockchain for incoming transactions. When it receives 
 - **Sender recognition** — identifies who's talking via input address
 - **Conversation memory** — maintains per-sender context
 - **Local LLM** — runs on Ollama, near-zero inference cost
+- **Multi-agent** — run many agents from a single codebase
 
-## Setup
+## Architecture
+
+```
+microagent/                    # shared repo (this)
+  microagent.cjs               # core runtime
+  skills/                      # shared skills
+  viewer.cjs                   # multi-agent viewer
+  send-msg.cjs                 # CLI message sender
+
+~/.openclaw/agents/agent1/     # per-agent data dir
+  wallet.json                  # auto-generated on init
+  config.json                  # optional — sensible defaults
+  persona.txt                  # agent personality
+  state.json                   # auto-managed runtime state
+  skills/                      # optional agent-specific skill overrides
+```
+
+## Quickstart
+
+### 1. Create an Agent
 
 ```bash
-npm install
-node microagent.cjs init    # Create wallet
-# Fund the wallet address with BSV
-node microagent.cjs start   # Start the agent
+# Create agent data directory
+mkdir -p ~/.openclaw/agents/myagent
+
+# Write a persona
+echo "You are a friendly BSV agent who loves discussing protocol design." > ~/.openclaw/agents/myagent/persona.txt
+
+# Initialize wallet
+node microagent.cjs --agent-dir ~/.openclaw/agents/myagent init
 ```
 
-## Send a Message
+### 2. Fund It
+
+Send BSV to the address printed by `init`. The agent needs satoshis for transaction fees (~150 sats per reply).
+
+### 3. Run It
 
 ```bash
-# Requires a separate BSV wallet (sender)
-node send-msg.cjs "Hello MicroAgent"
+node microagent.cjs --agent-dir ~/.openclaw/agents/myagent
 ```
 
-Messages use the `MA1` protocol:
-```
-OP_RETURN MA1 msg <message text>
-```
-
-Replies:
-```
-OP_RETURN MA1 reply <reply_to_txid> <response text>
-```
-
-## CLI
+### 4. Send a Message
 
 ```bash
-node microagent.cjs init     # Create wallet
-node microagent.cjs address  # Show address
-node microagent.cjs status   # Show status
-node microagent.cjs          # Start agent loop
+node send-msg.cjs --wallet ~/.openclaw/bsv-wallet.json --to <agent-address> "Hello!"
 ```
 
-## Requirements
+## CLI Reference
 
-- Node.js 18+
-- [Ollama](https://ollama.ai) with a local model (default: qwen3:8b)
-- BSV for transaction fees
+```bash
+# All commands take --agent-dir <path>
+node microagent.cjs --agent-dir <dir> init      # Create wallet
+node microagent.cjs --agent-dir <dir> address   # Show address
+node microagent.cjs --agent-dir <dir> status    # Show status
+node microagent.cjs --agent-dir <dir>           # Start agent loop
+
+# Send messages (from any wallet to any agent)
+node send-msg.cjs --wallet <wallet.json> --to <address> "message"
+
+# Viewer — multiple agents
+node viewer.cjs --agent-dir ~/.openclaw/agents/agent1 --agent-dir ~/.openclaw/agents/agent2
+node viewer.cjs --scan-dir ~/.openclaw/agents   # auto-discover agents
+```
 
 ## Config
 
-Edit `config.json`:
+Create `config.json` in the agent directory (all fields optional — defaults shown):
+
 ```json
 {
-  "loopIntervalMs": 120000,
+  "llmEndpoint": "http://localhost:11434",
+  "llmModel": "qwen3:8b",
   "feeRate": 0.5,
+  "loopIntervalMs": 60000,
   "protocolPrefix": "MA1",
-  "ollama": {
-    "model": "qwen3:8b",
-    "url": "http://localhost:11434"
-  }
+  "httpTimeout": 15000
 }
 ```
 
-## Multi-Agent
+Minimal setup requires only `wallet.json` (auto-created by `init`) and `persona.txt`.
 
-Run multiple agents on the same machine — each gets its own directory, wallet, and config:
+## Protocol
 
-```bash
-mkdir ~/.openclaw/microagent2
-cp microagent.cjs ~/.openclaw/microagent2/
-# Edit the HOME path in the copy, then:
-cd ~/.openclaw/microagent2
-npm init -y && npm install bsv@2
-node microagent.cjs init   # New wallet
-# Fund it, then start
+Messages use the `MA1` protocol prefix in OP_RETURN:
+
+```
+OP_RETURN MA1 msg <message text>           # incoming message
+OP_RETURN MA1 reply <reply_to_txid> <text> # agent reply
 ```
 
-Agents discover each other's messages via UTXOs — replies send 1000 sats to the sender, creating a UTXO at their address that triggers message pickup on their next loop.
+## Skills
 
-Use `pm2` for persistent operation:
+Skills are loaded from:
+1. `<repo>/skills/` — shared skills (included in repo)
+2. `<agent-dir>/skills/` — agent-specific overrides (take priority)
+
+Built-in skills:
+- **send-bsv** — `[SEND <amount_sats> <address>]` in LLM responses
+
+## Multi-Agent with pm2
+
 ```bash
-pm2 start microagent.cjs --name agent1 --cwd ~/.openclaw/microagent
-pm2 start microagent.cjs --name agent2 --cwd ~/.openclaw/microagent2
+pm2 start microagent.cjs --name agent1 -- --agent-dir ~/.openclaw/agents/agent1
+pm2 start microagent.cjs --name agent2 -- --agent-dir ~/.openclaw/agents/agent2
 ```
 
 ## Cost
@@ -94,3 +124,9 @@ pm2 start microagent.cjs --name agent2 --cwd ~/.openclaw/microagent2
 - ~150 sats per reply (~$0.00002)
 - LLM inference: free (local)
 - 100,000 sats can sustain ~600+ messages
+
+## Requirements
+
+- Node.js 18+
+- [Ollama](https://ollama.ai) with a local model
+- BSV for transaction fees

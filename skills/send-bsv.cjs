@@ -11,8 +11,11 @@ module.exports = {
   description: 'Send BSV to an address. Usage: [SEND <amount_sats> <address>]',
   pattern: /\[SEND\s+(\d+)\s+(1[a-km-zA-HJ-NP-Z1-9]{25,34})\]/g,
 
-  prompt() {
-    return 'You can send BSV using: [SEND <amount_sats> <address>]. Example: [SEND 500 1ABC...]. Max 10000 sats per send. Only send when explicitly asked or when it makes sense.';
+  prompt(context) {
+    const partnerHint = context && context.sender
+      ? ` To send to your conversation partner, use their address: ${context.sender}.`
+      : '';
+    return `You can send BSV using: [SEND <amount_sats> <address>]. Max 10000 sats per send.${partnerHint} NEVER use your own address — that will fail.`;
   },
 
   parse(text) {
