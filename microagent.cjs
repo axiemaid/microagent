@@ -448,7 +448,7 @@ async function loop(wallet, state) {
         contextStr +
         noRepeatSection +
         `\nNew message from ${sender}:\n"${text}"\n\n` +
-        `Reply with something NEW and different (under 100 chars). Never repeat yourself. Advance the conversation.`
+        `Reply with something NEW (under 500 chars). Never repeat yourself. Be specific — propose concrete designs, schemas, protocols, or action plans. Advance the conversation toward building something real.`
       );
 
       if (response && balance > 1000) {
@@ -476,7 +476,7 @@ async function loop(wallet, state) {
         if (extraSats > 0) {
           reply = reply ? `${reply} [sent ${extraSats} sats ✓]` : `[sent ${extraSats} sats ✓]`;
         }
-        reply = reply.substring(0, 150); // allow slightly longer for receipt
+        reply = reply.substring(0, 500);
         if (extraSats > 0) log(`SENDING: ${extraSats} extra sats to ${msg.sender} in reply tx`);
         log(`REPLYING: "${reply}"`);
         try {
