@@ -66,28 +66,30 @@ function loadState() {
 function saveState(state) { fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2)); }
 
 // === HTTP ===
-function httpGet(url) {
+function httpGet(url, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
-    mod.get(url, { headers: { 'User-Agent': 'microagent/1.0' } }, (res) => {
+    const req = mod.get(url, { headers: { 'User-Agent': 'microagent/1.0' }, timeout: timeoutMs }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+        if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
         try { resolve(JSON.parse(data)); } catch { resolve(data); }
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout: ${url}`)); });
   });
 }
 
-function httpPost(url, body) {
+function httpPost(url, body, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const mod = url.startsWith('https') ? https : http;
     const payload = JSON.stringify(body);
     const req = mod.request({
       hostname: parsed.hostname, port: parsed.port || (url.startsWith('https') ? 443 : 80),
-      path: parsed.pathname, method: 'POST',
+      path: parsed.pathname, method: 'POST', timeout: timeoutMs,
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
     }, (res) => {
       let data = '';
@@ -95,6 +97,7 @@ function httpPost(url, body) {
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
     });
     req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout: ${url}`)); });
     req.write(payload);
     req.end();
   });
