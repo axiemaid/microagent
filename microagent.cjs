@@ -211,8 +211,8 @@ function getAmountToAddress(tx, addr) {
 }
 
 // === SEND OP_RETURN TX ===
-async function sendOpReturn(wallet, dataStrings, recipientAddr) {
-  const SEND_AMOUNT = recipientAddr ? 1000 : 0; // send 1000 sats to recipient if specified
+async function sendOpReturn(wallet, dataStrings, recipientAddr, extraSats = 0) {
+  const SEND_AMOUNT = recipientAddr ? (1000 + extraSats) : 0; // base 1000 + any skill extras
   // Gather UTXOs
   let utxos = await getUtxos(wallet.address);
   if (!utxos.length) utxos = await getUnconfirmedUtxos(wallet.address);
@@ -442,23 +442,29 @@ async function loop(wallet, state) {
       if (response && balance > 1000) {
         // Execute skill commands from response
         let reply = response;
+        let extraSats = 0;
         for (const skill of SKILLS) {
           const actions = skill.parse(reply);
           for (const action of actions) {
-            log(`SKILL ${skill.name}: executing ${action.raw}`);
-            const result = await skill.execute(action, { wallet, sendBsv, log });
-            if (result.success) {
-              log(`SKILL ${skill.name}: success (txid: ${result.txid})`);
-            } else {
-              log(`SKILL ${skill.name}: failed (${result.error})`);
+            log(`SKILL ${skill.name}: ${action.raw}`);
+            // For send-bsv, accumulate sats to embed in the reply tx
+            if (skill.name === 'send-bsv' && action.address === msg.sender) {
+              extraSats += action.amount;
+              log(`SKILL ${skill.name}: +${action.amount} sats embedded in reply tx`);
+            } else if (skill.name === 'send-bsv') {
+              // Sending to a third party — still needs separate tx
+              const result = await skill.execute(action, { wallet, sendBsv, log });
+              if (result.success) log(`SKILL ${skill.name}: sent ${action.amount} to ${action.address} (txid: ${result.txid})`);
+              else log(`SKILL ${skill.name}: failed (${result.error})`);
             }
           }
           reply = skill.strip(reply);
         }
         reply = reply.substring(0, 100);
+        if (extraSats > 0) log(`SENDING: ${extraSats} extra sats to ${msg.sender} in reply tx`);
         log(`REPLYING: "${reply}"`);
         try {
-          const r = await sendOpReturn(wallet, [CONFIG.protocolPrefix, 'reply', msg.txid, reply], msg.sender);
+          const r = await sendOpReturn(wallet, [CONFIG.protocolPrefix, 'reply', msg.txid, reply], msg.sender, extraSats);
           log(`REPLY TX: ${r.txid} (fee: ${r.fee} sats)`);
           state.processedTxids.push(msg.txid); // Mark as processed AFTER successful reply
           state.actions.push({ type: 'reply', to: sender, replyTo: msg.txid, text: reply, txid: r.txid, time: Date.now() });
