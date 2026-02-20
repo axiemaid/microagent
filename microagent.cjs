@@ -325,7 +325,7 @@ async function think(prompt) {
       model: CONFIG.ollama.model,
       prompt: prompt,
       stream: false,
-      options: { temperature: 0.7, num_predict: 600 }
+      options: { temperature: 0.9, num_predict: 600, repeat_penalty: 1.5, repeat_last_n: 256 }
     });
     // qwen3 puts thinking in 'thinking' field and answer in 'response'
     // But sometimes everything ends up in 'thinking' and 'response' is empty
@@ -436,12 +436,19 @@ async function loop(wallet, state) {
       const persona = fs.existsSync(personaPath) ? fs.readFileSync(personaPath, 'utf8').trim() : '';
       const basePrompt = persona || `You are MicroAgent, a minimal autonomous agent living on the BSV blockchain.`;
 
+      // Build anti-repetition: collect this agent's recent replies
+      const myReplies = history.filter(h => h.role === 'me').slice(-5).map(h => h.text);
+      const noRepeatSection = myReplies.length > 0
+        ? `\nYour recent replies (DO NOT repeat or paraphrase any of these):\n${myReplies.map(r => `- "${r}"`).join('\n')}\n`
+        : '';
+
       const response = await think(
         `${basePrompt}\nAddress: ${wallet.address}. Balance: ${balance} sats. You communicate only through on-chain transactions.\n` +
         skillSection +
         contextStr +
+        noRepeatSection +
         `\nNew message from ${sender}:\n"${text}"\n\n` +
-        `Reply briefly (under 100 chars, every byte costs sats). Be direct.`
+        `Reply with something NEW and different (under 100 chars). Never repeat yourself. Advance the conversation.`
       );
 
       if (response && balance > 1000) {
