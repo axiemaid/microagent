@@ -192,7 +192,8 @@ function getAmountToAddress(tx, addr) {
 }
 
 // === SEND OP_RETURN TX ===
-async function sendOpReturn(wallet, dataStrings) {
+async function sendOpReturn(wallet, dataStrings, recipientAddr) {
+  const SEND_AMOUNT = recipientAddr ? 1000 : 0; // send 1000 sats to recipient if specified
   // Gather UTXOs
   let utxos = await getUtxos(wallet.address);
   if (!utxos.length) utxos = await getUnconfirmedUtxos(wallet.address);
@@ -211,7 +212,7 @@ async function sendOpReturn(wallet, dataStrings) {
     tx.addTxIn(txHashBuf, u.tx_pos, new bsv.Script(), 0xffffffff);
     inputTxOuts.push(txOut);
     inputSats += u.value;
-    if (inputSats > 5000) break;
+    if (inputSats > SEND_AMOUNT + 5000) break;
   }
 
   // Build OP_RETURN output
@@ -223,11 +224,16 @@ async function sendOpReturn(wallet, dataStrings) {
   }
   tx.addTxOut(new bsv.Bn(0), opScript);
 
+  // Payment to recipient (so they see this tx in their UTXOs)
+  if (recipientAddr) {
+    tx.addTxOut(new bsv.Bn(SEND_AMOUNT), bsv.Address.fromString(recipientAddr).toTxOutScript());
+  }
+
   // Estimate fee
-  const estSize = 150 + (dataStrings.join('').length) + 34; // rough estimate
+  const estSize = 150 + (dataStrings.join('').length) + 34 * (recipientAddr ? 2 : 1);
   const fee = Math.ceil(estSize * CONFIG.feeRate);
-  const change = inputSats - fee;
-  if (change < 0) throw new Error(`Insufficient funds: have ${inputSats}, need ${fee} for fee`);
+  const change = inputSats - SEND_AMOUNT - fee;
+  if (change < 0) throw new Error(`Insufficient funds: have ${inputSats}, need ${SEND_AMOUNT + fee}`);
 
   // Change output
   tx.addTxOut(new bsv.Bn(change), bsv.Address.fromString(wallet.address).toTxOutScript());
@@ -257,10 +263,35 @@ async function think(prompt) {
   try {
     const resp = await httpPost(`${CONFIG.ollama.url}/api/generate`, {
       model: CONFIG.ollama.model,
-      prompt: '/no_think\n' + prompt, stream: false,
-      options: { temperature: 0.7, num_predict: 200 }
+      prompt: prompt,
+      stream: false,
+      options: { temperature: 0.7, num_predict: 600 }
     });
-    const text = (resp.response || resp.thinking || '').trim();
+    // qwen3 puts thinking in 'thinking' field and answer in 'response'
+    // But sometimes everything ends up in 'thinking' and 'response' is empty
+    let text = (resp.response || '').trim();
+    
+    // If response is empty, try to extract answer from thinking field
+    if (!text && resp.thinking) {
+      const thinking = resp.thinking.trim();
+      // Look for a quoted reply or the last sentence after reasoning
+      const quotedMatch = thinking.match(/"([^"]{5,100})"/);
+      if (quotedMatch) {
+        text = quotedMatch[1];
+      } else {
+        // Take the last sentence-like fragment
+        const sentences = thinking.split(/[.!?]\s+/);
+        const last = sentences[sentences.length - 1]?.trim();
+        if (last && last.length > 2 && last.length < 120) text = last;
+      }
+    }
+    
+    // Strip think tags if they leak into response
+    if (text.includes('</think>')) text = text.split('</think>').pop().trim();
+    if (text.startsWith('<think>')) text = '';
+    text = text.replace(/<\/?think>/g, '').trim();
+    // Strip LLM "thinking aloud" preambles  
+    text = text.replace(/^(Okay|Alright|Let me|I need to|The user|Hmm|So|I should|I'll)[^.]*\.\s*/i, '').trim();
     return text || null;
   } catch (e) {
     log(`OLLAMA ERROR: ${e.message}`);
@@ -300,10 +331,13 @@ async function loop(wallet, state) {
         const msg = { txid, sender, amount, type: opReturn[0] || 'unknown', data: opReturn.slice(1), time: Date.now() };
         newMessages.push(msg);
         log(`MSG IN: from=${sender} type=${msg.type} data="${msg.data.join(' | ')}"`);
-      } else if (amount > 0 && sender && sender !== wallet.address && !opReturn) {
-        log(`PAYMENT IN: ${amount} sats from ${sender}`);
+        // Don't mark as processed yet — only after successful reply
+      } else {
+        if (amount > 0 && sender && sender !== wallet.address && !opReturn) {
+          log(`PAYMENT IN: ${amount} sats from ${sender}`);
+        }
+        state.processedTxids.push(txid); // non-message txids marked immediately
       }
-      state.processedTxids.push(txid);
     } catch (e) {
       log(`TX ERROR ${txid}: ${e.message}`);
     }
@@ -314,8 +348,9 @@ async function loop(wallet, state) {
 
   // Respond to messages
   for (const msg of newMessages) {
-    if (msg.type === 'msg') {
-      const text = msg.data.join(' ');
+    if (msg.type === 'msg' || msg.type === 'reply') {
+      // For reply type, data is [txid, ...text] — skip the txid reference
+      const text = msg.type === 'reply' ? msg.data.slice(1).join(' ') : msg.data.join(' ');
       const sender = msg.sender || 'unknown';
       log(`THINKING: "${text}" (from: ${sender})`);
 
@@ -343,8 +378,9 @@ async function loop(wallet, state) {
         const reply = response.substring(0, 100);
         log(`REPLYING: "${reply}"`);
         try {
-          const r = await sendOpReturn(wallet, [CONFIG.protocolPrefix, 'reply', msg.txid, reply]);
+          const r = await sendOpReturn(wallet, [CONFIG.protocolPrefix, 'reply', msg.txid, reply], msg.sender);
           log(`REPLY TX: ${r.txid} (fee: ${r.fee} sats)`);
+          state.processedTxids.push(msg.txid); // Mark as processed AFTER successful reply
           state.actions.push({ type: 'reply', to: sender, replyTo: msg.txid, text: reply, txid: r.txid, time: Date.now() });
 
           // Store conversation history

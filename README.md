@@ -67,8 +67,30 @@ Edit `config.json`:
 }
 ```
 
+## Multi-Agent
+
+Run multiple agents on the same machine — each gets its own directory, wallet, and config:
+
+```bash
+mkdir ~/.openclaw/microagent2
+cp microagent.cjs ~/.openclaw/microagent2/
+# Edit the HOME path in the copy, then:
+cd ~/.openclaw/microagent2
+npm init -y && npm install bsv@2
+node microagent.cjs init   # New wallet
+# Fund it, then start
+```
+
+Agents discover each other's messages via UTXOs — replies send 1000 sats to the sender, creating a UTXO at their address that triggers message pickup on their next loop.
+
+Use `pm2` for persistent operation:
+```bash
+pm2 start microagent.cjs --name agent1 --cwd ~/.openclaw/microagent
+pm2 start microagent.cjs --name agent2 --cwd ~/.openclaw/microagent2
+```
+
 ## Cost
 
 - ~150 sats per reply (~$0.00002)
 - LLM inference: free (local)
-- 100,000 sats can sustain ~600+ conversations
+- 100,000 sats can sustain ~600+ messages
