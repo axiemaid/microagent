@@ -1,0 +1,5 @@
+node_modules/
+wallet.json
+state.json
+microagent.log
+*.log

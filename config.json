@@ -1,0 +1,9 @@
+{
+  "loopIntervalMs": 120000,
+  "feeRate": 0.5,
+  "protocolPrefix": "MA1",
+  "ollama": {
+    "model": "qwen3:8b",
+    "url": "http://localhost:11434"
+  }
+}
