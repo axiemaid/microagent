@@ -13,6 +13,25 @@ const WALLET_PATH = path.join(HOME, 'wallet.json');
 const STATE_PATH = path.join(HOME, 'state.json');
 const CONFIG_PATH = path.join(HOME, 'config.json');
 const LOG_PATH = path.join(HOME, 'microagent.log');
+const SKILLS_DIR = path.join(HOME, 'skills');
+
+// === SKILLS ===
+function loadSkills() {
+  const skills = [];
+  if (!fs.existsSync(SKILLS_DIR)) return skills;
+  for (const file of fs.readdirSync(SKILLS_DIR)) {
+    if (!file.endsWith('.cjs')) continue;
+    try {
+      const skill = require(path.join(SKILLS_DIR, file));
+      skills.push(skill);
+    } catch (e) {
+      console.error(`Failed to load skill ${file}: ${e.message}`);
+    }
+  }
+  return skills;
+}
+
+const SKILLS = loadSkills();
 
 // === CONFIG ===
 const DEFAULT_CONFIG = {
@@ -82,7 +101,7 @@ function httpGet(url, timeoutMs = 15000) {
   });
 }
 
-function httpPost(url, body, timeoutMs = 30000) {
+function httpPost(url, body, timeoutMs = 90000) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const mod = url.startsWith('https') ? https : http;
@@ -258,6 +277,47 @@ async function sendOpReturn(wallet, dataStrings, recipientAddr) {
   return { txid, fee, result };
 }
 
+// === SEND BSV (plain transfer, no OP_RETURN) ===
+async function sendBsv(wallet, amountSats, toAddress) {
+  let utxos = await getUtxos(wallet.address);
+  if (!utxos.length) utxos = await getUnconfirmedUtxos(wallet.address);
+  if (!utxos.length) throw new Error('No UTXOs');
+
+  const tx = new bsv.Tx();
+  const inputTxOuts = [];
+  let inputSats = 0;
+
+  for (const u of utxos) {
+    const rawHex = await getRawTx(u.tx_hash);
+    const prevTx = bsv.Tx.fromHex(typeof rawHex === 'string' ? rawHex : rawHex.hex || rawHex);
+    tx.addTxIn(Buffer.from(u.tx_hash, 'hex').reverse(), u.tx_pos, new bsv.Script(), 0xffffffff);
+    inputTxOuts.push(prevTx.txOuts[u.tx_pos]);
+    inputSats += u.value;
+    if (inputSats > amountSats + 5000) break;
+  }
+
+  tx.addTxOut(new bsv.Bn(amountSats), bsv.Address.fromString(toAddress).toTxOutScript());
+
+  const estSize = 150 + 34 * 2;
+  const fee = Math.ceil(estSize * CONFIG.feeRate);
+  const change = inputSats - amountSats - fee;
+  if (change < 0) throw new Error(`Insufficient funds: have ${inputSats}, need ${amountSats + fee}`);
+  tx.addTxOut(new bsv.Bn(change), bsv.Address.fromString(wallet.address).toTxOutScript());
+
+  for (let i = 0; i < inputTxOuts.length; i++) {
+    const sig = tx.sign(wallet.keyPair, bsv.Sig.SIGHASH_ALL | bsv.Sig.SIGHASH_FORKID, i, inputTxOuts[i].script, inputTxOuts[i].valueBn);
+    const scriptSig = new bsv.Script();
+    scriptSig.writeBuffer(sig.toTxFormat());
+    scriptSig.writeBuffer(wallet.keyPair.pubKey.toBuffer());
+    tx.txIns[i].setScript(scriptSig);
+  }
+
+  const hex = tx.toHex();
+  const txid = Buffer.from(tx.hash()).reverse().toString('hex');
+  await broadcast(hex);
+  return { txid, fee };
+}
+
 // === OLLAMA ===
 async function think(prompt) {
   try {
@@ -367,15 +427,35 @@ async function loop(wallet, state) {
           recent.map(h => `${h.role}: ${h.text}`).join('\n') + '\n';
       }
 
+      // Build skill prompts
+      const skillPrompts = SKILLS.map(s => s.prompt()).filter(Boolean).join('\n');
+      const skillSection = skillPrompts ? `\nAvailable commands:\n${skillPrompts}\n` : '';
+
       const response = await think(
         `You are MicroAgent, a minimal autonomous agent living on the BSV blockchain. Address: ${wallet.address}. Balance: ${balance} sats. You communicate only through on-chain transactions.\n` +
+        skillSection +
         contextStr +
         `\nNew message from ${sender}:\n"${text}"\n\n` +
         `Reply briefly (under 100 chars, every byte costs sats). Be direct. Continue the conversation naturally if there's history.`
       );
 
       if (response && balance > 1000) {
-        const reply = response.substring(0, 100);
+        // Execute skill commands from response
+        let reply = response;
+        for (const skill of SKILLS) {
+          const actions = skill.parse(reply);
+          for (const action of actions) {
+            log(`SKILL ${skill.name}: executing ${action.raw}`);
+            const result = await skill.execute(action, { wallet, sendBsv, log });
+            if (result.success) {
+              log(`SKILL ${skill.name}: success (txid: ${result.txid})`);
+            } else {
+              log(`SKILL ${skill.name}: failed (${result.error})`);
+            }
+          }
+          reply = skill.strip(reply);
+        }
+        reply = reply.substring(0, 100);
         log(`REPLYING: "${reply}"`);
         try {
           const r = await sendOpReturn(wallet, [CONFIG.protocolPrefix, 'reply', msg.txid, reply], msg.sender);
