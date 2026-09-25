@@ -524,19 +524,36 @@ async function execCode(code, wallet, state) {
   };
 
   try {
-    // Wrap code in async IIFE to support top-level await
-    const wrappedCode = `(async () => { ${code} })();`;
+    // Wrap code in async function to support top-level await
+    // Detect if agent already wrote an async IIFE or async function
+    const hasAsyncWrap = /^\s*\(async\s*\(?\s*\)\s*=>/.test(code) || /^\s*async\s+function/.test(code);
+    let wrappedCode;
+    if (hasAsyncWrap) {
+      // Agent already wrote async wrapper — wrap in async IIFE to await result
+      wrappedCode = `(async () => { var __result = (${code}); if (__result && typeof __result.then === 'function') __result = await __result; return __result; })();`;
+    } else {
+      // Wrap in async IIFE. Try to capture the last expression as return value.
+      let body = code.trim();
+      if (body.endsWith(';')) body = body.slice(0, -1);
+      const lastSemi = body.lastIndexOf(';');
+      const lastExpr = lastSemi >= 0 ? body.substring(lastSemi + 1).trim() : body;
+      const isControlFlow = /^(if|for|while|try|catch|switch|do|return|var|let|const|function|class)\b/.test(lastExpr);
+      if (isControlFlow || lastExpr === '') {
+        wrappedCode = `(async () => { ${code} })();`;
+      } else if (lastSemi >= 0) {
+        wrappedCode = `(async () => { ${body.substring(0, lastSemi + 1)} return (${lastExpr}); })();`;
+      } else {
+        wrappedCode = `(async () => { return (${body}); })();`;
+      }
+    }
     const script = new vm.Script(wrappedCode, { timeout: 60000 });
     const context = vm.createContext(sandbox);
     const result = script.runInContext(context, { timeout: 60000 });
     const finalResult = (result && typeof result.then === 'function') ? await result : result;
-    // Include chain query log if present
     let output = typeof finalResult === 'object' ? JSON.stringify(finalResult, null, 2) : String(finalResult);
-    if (output === 'undefined' && chainResults.length > 0) {
-      // If no explicit return but chain queries were made, show the query log
+    if ((output === 'undefined' || output === 'null') && chainResults.length > 0) {
       output = 'Chain queries made: ' + chainResults.map(r => `${r.method}()${r.error ? ' ERR:' + r.error : ''}`).join(', ');
     } else if (chainResults.length > 0) {
-      // Append chain query summary at the end
       output += '\n[Chain queries: ' + chainResults.map(r => r.method + (r.error ? '!' : '')).join(', ') + ']';
     }
     return { success: true, output: output.substring(0, 1000) };
