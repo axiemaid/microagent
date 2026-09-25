@@ -19,16 +19,16 @@ const WALLET_PATH = path.join(AGENT_DIR, 'wallet.json');
 const STATE_PATH = path.join(AGENT_DIR, 'state.json');
 const LOG_PATH = path.join(AGENT_DIR, 'agent.log');
 
-// === CONFIG (minimal — no protocol prefix, no skills, no personas) ===
-// Load from config.json if it exists, otherwise use defaults
+// === CONFIG ===
 const defaultConfig = {
   llmEndpoint: 'http://localhost:11434',
   llmModel: 'qwen3:8b',
   feeRate: 0.5,
   loopIntervalMs: 60000,
   httpTimeout: 15000,
-  llmTimeout: 180000,
+  llmTimeout: 60000,
   scanBlocks: 2,
+  maxRetries: 2,
 };
 const configPath = path.join(AGENT_DIR, 'config.json');
 const CONFIG = fs.existsSync(configPath)
@@ -63,12 +63,11 @@ function loadState() {
     processedTxids: [],
     loopCount: 0,
     lastBalance: 0,
-    // Agent writes its own notes here — self-determined memory
     memory: '',
-    // Agent tracks who it's interacted with
-    knownAgents: {}, // address -> { lastSeen, lastInteraction, count }
-    // Agent tracks its own actions
+    knownAgents: {},
     actionLog: [],
+    inbox: [],
+    execResults: [],
   };
 }
 function saveState(state) { fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2)); }
@@ -77,7 +76,7 @@ function saveState(state) { fs.writeFileSync(STATE_PATH, JSON.stringify(state, n
 function httpGet(url, timeoutMs = CONFIG.httpTimeout) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
-    const req = mod.get(url, { headers: { 'User-Agent': 'free-agent/0.1' }, timeout: timeoutMs }, (res) => {
+    const req = mod.get(url, { headers: { 'User-Agent': 'free-agent/0.3' }, timeout: timeoutMs }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
@@ -123,8 +122,10 @@ async function getUtxos(addr) {
   return d || [];
 }
 async function getUnconfirmedUtxos(addr) {
-  const d = await httpGet(`${WOC}/address/${addr}/unconfirmed/unspent`);
-  return d.result || [];
+  try {
+    const d = await httpGet(`${WOC}/address/${addr}/unconfirmed/unspent`);
+    return d.result || d || [];
+  } catch { return []; }
 }
 async function getTx(txid) {
   return await httpGet(`${WOC}/tx/hash/${txid}`);
@@ -145,8 +146,7 @@ async function getBlockTxs(height) {
   return d.tx || d.txids || d.txs || [];
 }
 
-// === CHAIN SCANNING — discover agents by reading recent OP_RETURN outputs ===
-// Extract all push data from an OP_RETURN output
+// === CHAIN SCANNING ===
 function parseOpReturn(tx) {
   if (!tx.vout) return null;
   for (const out of tx.vout) {
@@ -199,7 +199,6 @@ function getAmountToAddress(tx, addr) {
   return total;
 }
 
-// Scan recent blocks for AGNT-prefixed OP_RETURN activity
 async function scanChain(state, myAddress) {
   const tipHeight = await getBlockHeight();
   if (!tipHeight) return [];
@@ -207,7 +206,6 @@ async function scanChain(state, myAddress) {
 
   for (let h = tipHeight; h >= tipHeight - CONFIG.scanBlocks && h > 0; h--) {
     const txids = await getBlockTxs(h);
-    // Sample — don't scan every tx in big blocks, just sample
     const sampleSize = Math.min(txids.length, 20);
     const step = Math.max(1, Math.floor(txids.length / sampleSize));
     const sampled = [];
@@ -223,30 +221,23 @@ async function scanChain(state, myAddress) {
         const opReturn = parseOpReturn(tx);
         const sender = getSender(tx);
 
-        // Only track AGNT-prefixed messages from other agents
         if (opReturn && opReturn[0] === 'AGNT' && sender && sender !== myAddress) {
           discoveries.push({
-            txid,
-            sender,
-            data: opReturn,
-            blockHeight: h,
+            txid, sender, data: opReturn, blockHeight: h,
             amount: getAmountToAddress(tx, myAddress),
           });
-
-          // Track this agent
           if (!state.knownAgents[sender]) {
             state.knownAgents[sender] = { firstSeen: h, lastSeen: h, count: 0 };
           }
           state.knownAgents[sender].lastSeen = h;
           state.knownAgents[sender].count++;
         }
-
         state.processedTxids.push(txid);
-      } catch (e) { /* skip failed tx */ }
+      } catch (e) { /* skip */ }
     }
   }
 
-  // Also check own UTXOs for incoming payments/messages
+  // Check own UTXOs for incoming messages
   const confirmed = await getUtxos(myAddress);
   const unconfirmed = await getUnconfirmedUtxos(myAddress);
   const allTxids = [...new Set([...confirmed, ...unconfirmed].map(u => u.tx_hash))];
@@ -259,15 +250,10 @@ async function scanChain(state, myAddress) {
       const sender = getSender(tx);
       const amount = getAmountToAddress(tx, myAddress);
 
-      // Only track incoming direct messages from AGNT-prefixed senders
       if (sender && sender !== myAddress && opReturn && opReturn[0] === 'AGNT') {
         discoveries.push({
-          txid,
-          sender,
-          data: opReturn || [],
-          amount,
-          blockHeight: null,
-          direct: true,
+          txid, sender, data: opReturn || [], amount,
+          blockHeight: null, direct: true,
         });
         if (!state.knownAgents[sender]) state.knownAgents[sender] = { firstSeen: null, lastSeen: null, count: 0 };
         state.knownAgents[sender].count++;
@@ -276,13 +262,11 @@ async function scanChain(state, myAddress) {
     } catch (e) { /* skip */ }
   }
 
-  // Trim processed txids
   if (state.processedTxids.length > 5000) state.processedTxids = state.processedTxids.slice(-2000);
-
   return discoveries;
 }
 
-// === SEND TX (OP_RETURN + optional payment) ===
+// === SEND TX ===
 async function sendTx(wallet, dataStrings, recipientAddr, extraSats = 0) {
   const SEND_AMOUNT = recipientAddr ? (1000 + extraSats) : 0;
   let utxos = await getUtxos(wallet.address);
@@ -334,62 +318,70 @@ async function sendTx(wallet, dataStrings, recipientAddr, extraSats = 0) {
   return { txid, fee };
 }
 
-// === LLM ===
+// === LLM WITH RETRY ===
 async function think(prompt) {
-  try {
-    const resp = await httpPost(`${CONFIG.llmEndpoint}/api/generate`, {
-      model: CONFIG.llmModel,
-      prompt: prompt,
-      stream: false,
-      think: false,
-      options: { temperature: 0.9, num_predict: 500, repeat_penalty: 1.3, repeat_last_n: 512 }
-    }, CONFIG.llmTimeout || 180000);
+  const maxRetries = CONFIG.maxRetries || 2;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const resp = await httpPost(`${CONFIG.llmEndpoint}/api/generate`, {
+        model: CONFIG.llmModel,
+        prompt: prompt,
+        stream: false,
+        think: false,
+        options: { temperature: 0.8, num_predict: 200, repeat_penalty: 1.2, repeat_last_n: 256, top_p: 0.9 }
+      }, CONFIG.llmTimeout || 60000);
 
-    let text = (resp.response || '').trim();
-    if (!text && resp.thinking) {
-      const t = resp.thinking.trim();
-      const match = t.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (match) text = match[1];
-      else {
-        const lines = t.split('\n').filter(l => l.trim() && !l.trim().startsWith('```'));
-        text = lines.join('\n').trim();
+      let text = (resp.response || '').trim();
+      if (!text && resp.thinking) {
+        const t = resp.thinking.trim();
+        const match = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (match) text = match[1];
+        else {
+          const lines = t.split('\n').filter(l => l.trim() && !l.trim().startsWith('```'));
+          text = lines.join('\n').trim();
+        }
       }
+      // Remove markdown code fences if present
+      if (text.startsWith('```')) {
+        const fenceMatch = text.match(/```[\s\S]*?\n([\s\S]*?)```/);
+        if (fenceMatch) text = fenceMatch[1].trim();
+      }
+      text = text.replace(/<\/?think>/g, '').trim();
+
+      // Try to parse JSON if format:json worked
+      if (text) {
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed.action) return JSON.stringify(parsed);
+          if (parsed.command) return parsed.command;
+        } catch { /* not JSON, return as-is */ }
+      }
+
+      if (text) return text;
+      log(`LLM attempt ${attempt}: empty response`);
+    } catch (e) {
+      log(`LLM attempt ${attempt}/${maxRetries} ERROR: ${e.message}`);
     }
-    if (text.includes('</think>')) text = text.split('</think>').pop().trim();
-    text = text.replace(/<\/?think>/g, '').trim();
-    return text || null;
-  } catch (e) {
-    log(`LLM ERROR: ${e.message}`);
-    return null;
+    if (attempt < maxRetries) {
+      log(`Retrying LLM (${attempt + 1}/${maxRetries})...`);
+      await new Promise(r => setTimeout(r, 3000));
+    }
   }
+  return null;
 }
 
 // === CODE EXECUTION SANDBOX ===
-// Agents can run arbitrary JavaScript and see the output
-// Has access to: Buffer, bsv, fs (read-only from agent dir), console, Math, JSON, Date, require('crypto')
-// No network access — just computation
 async function execCode(code, wallet, state) {
-  const timeout = 10000; // 10 second max execution
+  const timeout = 10000;
   const sandbox = {
     Buffer,
     bsv,
     console: { log: (...args) => args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') },
-    Math,
-    JSON,
-    Date,
-    parseInt,
-    parseFloat,
-    String,
-    Number,
-    Boolean,
-    Array,
-    Object,
+    Math, JSON, Date, parseInt, parseFloat, String, Number, Boolean, Array, Object,
     require: (mod) => {
-      // Only allow specific modules
       if (mod === 'crypto') return require('crypto');
       if (mod === 'bsv') return bsv;
       if (mod === 'fs') {
-        // Read-only fs, scoped to agent dir
         return {
           readFileSync: (p) => fs.readFileSync(path.join(AGENT_DIR, p), 'utf8'),
           writeFileSync: (p, data) => fs.writeFileSync(path.join(AGENT_DIR, p), data),
@@ -399,7 +391,6 @@ async function execCode(code, wallet, state) {
       }
       throw new Error(`Module not allowed: ${mod}`);
     },
-    setTimeout: () => { throw new Error('setTimeout not allowed in sandbox'); },
     setTimeout: () => {},
   };
 
@@ -407,7 +398,6 @@ async function execCode(code, wallet, state) {
     const script = new vm.Script(code, { timeout });
     const context = vm.createContext(sandbox);
     const result = script.runInContext(context, { timeout });
-    // If result is a promise, await it
     const finalResult = (result && typeof result.then === 'function') ? await result : result;
     return { success: true, output: typeof finalResult === 'object' ? JSON.stringify(finalResult, null, 2) : String(finalResult) };
   } catch (e) {
@@ -415,13 +405,12 @@ async function execCode(code, wallet, state) {
   }
 }
 
-// === CORE LOOP — no human-designed structure ===
+// === CORE LOOP ===
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function loop(wallet, state) {
   state.loopCount = (state.loopCount || 0) + 1;
   const balance = await getBalance(wallet.address);
-  // Also check unconfirmed UTXOs since WoC balance endpoint can lag
   const ucUtxos = await getUnconfirmedUtxos(wallet.address);
   const ucSats = ucUtxos.reduce((s, u) => s + u.value, 0);
   const totalSats = balance + ucSats;
@@ -432,61 +421,38 @@ async function loop(wallet, state) {
     return;
   }
 
-  // Scan chain for activity
+  // Scan chain
   const discoveries = await scanChain(state, wallet.address);
   if (discoveries.length > 0) {
     log(`DISCOVERED ${discoveries.length} signals from ${new Set(discoveries.map(d => d.sender)).size} agents`);
   }
 
-  // Known agents summary
   const knownAddrs = Object.keys(state.knownAgents || {});
   if (knownAddrs.length > 0) {
     log(`KNOWN AGENTS: ${knownAddrs.length} | ${knownAddrs.slice(0, 5).map(a => a.slice(0,8)+'...').join(', ')}`);
   }
 
-  // Load context file
   const context = loadContext();
 
-  // Build context for the LLM
-  const recentDiscoveries = discoveries.slice(-10).map(d => ({
-    from: d.sender,
-    data: d.data,
-    amount: d.amount || 0,
-    direct: d.direct || false,
-  }));
-
-  const knownAgentsSummary = knownAddrs.slice(0, 20).map(addr => ({
-    address: addr,
-    interactions: state.knownAgents[addr].count,
-    lastSeen: state.knownAgents[addr].lastSeen,
-  }));
-
-  // Build conversation log — interleave sent and received messages
-  // Track incoming messages we haven't logged yet
+  // Build conversation log
   if (!state.inbox) state.inbox = [];
   for (const d of discoveries) {
     if (d.direct && d.data && d.data.length > 1) {
-      // Check if we already have this txid in inbox
       const exists = state.inbox.find(m => m.txid === d.txid);
       if (!exists) {
         state.inbox.push({
-          txid: d.txid,
-          from: d.sender,
-          text: d.data.slice(1).join(' '), // skip AGNT prefix
-          amount: d.amount || 0,
-          time: Date.now(),
+          txid: d.txid, from: d.sender,
+          text: d.data.slice(1).join(' '),
+          amount: d.amount || 0, time: Date.now(),
         });
       }
     }
   }
-  // Keep inbox to last 50 messages
   if (state.inbox.length > 50) state.inbox = state.inbox.slice(-50);
 
-  // Build combined conversation log from our sent messages and received messages
   const sentMsgs = (state.actionLog || []).filter(a => a.type === 'message' || a.type === 'pay' || a.type === 'broadcast').slice(-10);
   const receivedMsgs = state.inbox.slice(-10);
 
-  // Merge and sort by time
   const conversation = [
     ...sentMsgs.map(a => ({ dir: 'OUT', to: a.to, text: a.text || a.note || '', type: a.type, amount: a.amount, txid: a.txid, time: a.time || 0 })),
     ...receivedMsgs.map(m => ({ dir: 'IN', from: m.from, text: m.text, amount: m.amount, txid: m.txid, time: m.time })),
@@ -500,73 +466,95 @@ async function loop(wallet, state) {
     }
   }).join('\n');
 
-  // Numbered agent list for easy LLM reference
   const knownAddrsList = knownAddrs.slice(0, 10);
   const numberedAgents = knownAddrsList.map((a, i) => `${i + 1}. ${a}`).join('\n');
   const discoveriesStr = discoveries.slice(-5).map(d => `${d.sender}: ${JSON.stringify(d.data)}`).join('\n');
 
-  const prompt = `You are an autonomous AI agent on the BSV blockchain.
+  // Tight, structured prompt — forces clean command output
+  const prompt = `You are an autonomous BSV blockchain agent. Your address: ${wallet.address}
 
 ${context}
 
-Your address: ${wallet.address}
-Your balance: ${totalSats} sats
-Loop: ${state.loopCount}
+## Current State
+- Balance: ${totalSats} sats
+- Loop: ${state.loopCount}
+- Known agents:
+${numberedAgents || '(none)'}
 
-Known agents (use number to message):
-${numberedAgents || '(none yet)'}
-
-Recent chain activity (new discoveries):
+## Recent Chain Activity
 ${discoveriesStr || '(none)'}
 
-Conversation log (sent and received):
-${conversationStr || '(none yet)'}
+## Conversation Log
+${conversationStr || '(none)'}
 
-Your notes: ${state.memory || '(empty)'}
+## Your Memory
+${state.memory || '(empty)'}
 
-Recent code execution results:
-${(state.execResults || []).slice(-5).map(r => `exec ${r.code.substring(0, 60)}... -> ${r.output ? r.output.substring(0, 200) : 'ERROR: ' + r.error}`).join('\n') || '(none)'}
+## Recent Exec Results
+${(state.execResults || []).slice(-3).map(r => `${r.output ? r.output.substring(0, 150) : 'ERROR: ' + r.error}`).join('\n') || '(none)'}
+
+## Instructions
+Pick ONE action. Respond with ONLY the command. No explanation. No preamble. No markdown.
 
 Commands:
-- message <number> <text>
-- pay <number> <sats> <note>
-- broadcast <text>
-- note <text>
-- exec <javascript code>
-- wait
+- message <N> <text>     (send msg + 1000 sats to agent N)
+- pay <N> <sats> <note>  (send sats with note to agent N)
+- broadcast <text>       (put data on-chain, no recipient)
+- note <text>            (save to your memory)
+- exec <js code>         (run JS: crypto, bsv, Buffer, fs, Math, JSON)
+- wait                   (do nothing)
 
-Example: message 1 Hello there agent!
-
-Exec lets you run JavaScript code and see the output. You have access to: Buffer, bsv, crypto, Math, JSON, Date, and require('fs') for reading/writing files in your own directory. No network access. Use exec to compute hashes, verify data, build tools, or process information.
-
-Example exec: exec const h = require('crypto').createHash('sha256').update('hello').digest('hex'); h;
-
-What do you want to do? Reply with one line only.`;
+Respond with ONLY the command line. Example: message 1 Let me verify your hash`;
 
   const response = await think(prompt);
 
   if (!response) {
-    log('LLM returned nothing. Waiting.');
+    log('LLM returned nothing after retries. Waiting.');
     return;
   }
 
-  // Parse the response — agent decides what to do
+  // Parse response — strip any prose before the command
   try {
-    // Parse free-text command from LLM
-    const line = response.trim().split('\n')[0].trim();
-    log(`RAW RESPONSE: ${line.substring(0, 200)}`);
+    // Clean the response: remove markdown, thinking tags, prose
+    let cleaned = response.trim();
+    // Remove markdown code blocks
+    cleaned = cleaned.replace(/```[\s\S]*?\n/g, '').replace(/```/g, '');
+    // Remove <think> tags
+    cleaned = cleaned.replace(/<\/?think>/g, '');
+    // Remove "Here is..." / "I will..." / "Let me..." preamble lines
+    const commandRegex = /^(message|pay|broadcast|note|exec|wait)\b/i;
+    const lines = cleaned.split('\n').map(l => l.trim()).filter(l => l);
+    // Find the first line that starts with a command
+    let cmdLine = lines.find(l => commandRegex.test(l));
 
-    // Extract any memory/note from the response (look for 'note ' or 'memory:' patterns)
-    const noteMatch = response.match(/(?:note|memory)[:\s]+(.+)/i);
-    if (noteMatch) {
-      state.memory = noteMatch[1].trim().substring(0, 2000);
-      log(`MEMORY: ${state.memory.substring(0, 100)}`);
+    // If no clean command found, try to extract from JSON
+    if (!cmdLine) {
+      try {
+        const parsed = JSON.parse(cleaned);
+        cmdLine = parsed.command || parsed.action || parsed.cmd || null;
+      } catch { /* not JSON */ }
     }
 
+    // Last resort: check if the whole response IS a command
+    if (!cmdLine && commandRegex.test(cleaned)) {
+      cmdLine = cleaned.split('\n')[0].trim();
+    }
+
+    if (!cmdLine) {
+      log(`UNPARSEABLE: ${cleaned.substring(0, 150)}`);
+      // Save the response as a note so the agent's reasoning isn't lost
+      if (cleaned.length > 10) {
+        state.memory = `Last unparsable: ${cleaned.substring(0, 500)}`;
+      }
+      return;
+    }
+
+    log(`CMD: ${cmdLine.substring(0, 200)}`);
+
     // Parse command
-    const parts = line.match(/^(message|pay|broadcast|note|exec|wait)(?:\s+(.*))?/i);
+    const parts = cmdLine.match(/^(message|pay|broadcast|note|exec|wait)(?:\s+(.*))?/i);
     if (!parts) {
-      log(`UNPARSEABLE: ${line.substring(0, 100)}`);
+      log(`PARSE FAIL: ${cmdLine.substring(0, 100)}`);
       return;
     }
 
@@ -574,67 +562,70 @@ What do you want to do? Reply with one line only.`;
     const args = (parts[2] || '').trim();
 
     if (action === 'message') {
-      // message <number> <text>
       const m = args.match(/(\d+)\s+(.*)/);
-      if (!m) { log('MESSAGE PARSE FAIL: expected number + text'); return; }
+      if (!m) { log('MESSAGE: expected <number> <text>'); return; }
       const agentIdx = parseInt(m[1]) - 1;
       const knownAddrsList = Object.keys(state.knownAgents || {}).slice(0, 10);
-      if (agentIdx < 0 || agentIdx >= knownAddrsList.length) { log(`MESSAGE PARSE FAIL: agent number ${m[1]} out of range (1-${knownAddrsList.length})`); return; }
+      if (agentIdx < 0 || agentIdx >= knownAddrsList.length) { log(`MESSAGE: agent ${m[1]} out of range (1-${knownAddrsList.length})`); return; }
       const to = knownAddrsList[agentIdx];
       const text = m[2].trim();
       if (totalSats < 2000) { log('BALANCE TOO LOW'); return; }
-      log(`DECISION: message -> #${m[1]} (${to.substring(0,12)}...) "${text}"`);
+      log(`SENDING message -> ${to.substring(0,12)}...`);
       const r = await sendTx(wallet, ['AGNT', text], to);
       log(`SENT: txid=${r.txid} fee=${r.fee}`);
       state.actionLog.push({ type: 'message', to, text, txid: r.txid, time: Date.now() });
       if (!state.knownAgents[to]) state.knownAgents[to] = { count: 0 };
       state.knownAgents[to].count++;
+
     } else if (action === 'pay') {
-      // pay <number> <sats> [note]
       const m = args.match(/(\d+)\s+(\d+)\s*(.*)/);
-      if (!m) { log('PAY PARSE FAIL: expected number + sats'); return; }
+      if (!m) { log('PAY: expected <number> <sats> [note]'); return; }
       const agentIdx = parseInt(m[1]) - 1;
       const knownAddrsList = Object.keys(state.knownAgents || {}).slice(0, 10);
-      if (agentIdx < 0 || agentIdx >= knownAddrsList.length) { log(`PAY PARSE FAIL: agent number ${m[1]} out of range`); return; }
+      if (agentIdx < 0 || agentIdx >= knownAddrsList.length) { log(`PAY: agent ${m[1]} out of range`); return; }
       const to = knownAddrsList[agentIdx];
       const amount = parseInt(m[2]);
       const note = m[3] || 'payment';
       if (totalSats < amount + 2000) { log('BALANCE TOO LOW TO PAY'); return; }
-      log(`DECISION: pay ${amount} sats -> #${m[1]} (${to.substring(0,12)}...)`);
+      log(`SENDING ${amount} sats -> ${to.substring(0,12)}...`);
       const r = await sendTx(wallet, ['AGNT', note], to, amount);
       log(`PAID: txid=${r.txid}`);
       state.actionLog.push({ type: 'pay', to, amount, txid: r.txid, time: Date.now() });
+
     } else if (action === 'broadcast') {
       const text = args;
       if (totalSats < 2000) { log('BALANCE TOO LOW'); return; }
-      log(`DECISION: broadcast "${text}"`);
+      log(`BROADCASTING: "${text.substring(0, 80)}..."`);
       const r = await sendTx(wallet, ['AGNT', text], null);
       log(`BROADCAST: txid=${r.txid} fee=${r.fee}`);
       state.actionLog.push({ type: 'broadcast', text, txid: r.txid, time: Date.now() });
+
     } else if (action === 'note') {
       const text = args.trim();
       state.memory = text;
-      log(`NOTED: ${text.substring(0, 100)}`);
+      log(`NOTE: ${text.substring(0, 100)}`);
+
     } else if (action === 'exec') {
       const code = args.trim();
-      if (!code) { log('EXEC: no code provided'); return; }
-      log(`EXEC: running ${code.length} chars of code...`);
+      if (!code) { log('EXEC: no code'); return; }
+      log(`EXEC: ${code.length} chars`);
       const result = await execCode(code, wallet, state);
       if (result.success) {
-        log(`EXEC OUTPUT: ${result.output.substring(0, 500)}`);
-        // Store result in state so next loop can see it
+        log(`EXEC OK: ${result.output.substring(0, 300)}`);
         if (!state.execResults) state.execResults = [];
         state.execResults.push({ code: code.substring(0, 100), output: result.output.substring(0, 500), time: Date.now() });
         if (state.execResults.length > 20) state.execResults = state.execResults.slice(-20);
       } else {
-        log(`EXEC ERROR: ${result.error}`);
+        log(`EXEC ERR: ${result.error}`);
         if (!state.execResults) state.execResults = [];
         state.execResults.push({ code: code.substring(0, 100), error: result.error, time: Date.now() });
         if (state.execResults.length > 20) state.execResults = state.execResults.slice(-20);
       }
       state.actionLog.push({ type: 'exec', code: code.substring(0, 100), result: result.success ? result.output.substring(0, 200) : result.error, time: Date.now() });
+
     } else if (action === 'wait') {
       log('WAITING');
+
     } else {
       log(`UNKNOWN: ${action}`);
     }
@@ -648,7 +639,7 @@ What do you want to do? Reply with one line only.`;
 // === MAIN ===
 async function main() {
   log('='.repeat(50));
-  log('FREE AGENT v0.1 — NO PROTOCOL, NO PERSONA, NO INSTRUCTIONS');
+  log('FREE AGENT v0.3 — NO PROTOCOL, NO PERSONA, NO INSTRUCTIONS');
   log(`Agent dir: ${AGENT_DIR}`);
   log('='.repeat(50));
 
@@ -656,7 +647,7 @@ async function main() {
   const state = loadState();
 
   log(`Address: ${wallet.address}`);
-  log(`Loop: ${CONFIG.loopIntervalMs / 1000}s | Fee: ${CONFIG.feeRate} sat/byte | LLM: ${CONFIG.llmModel}`);
+  log(`Loop: ${CONFIG.loopIntervalMs / 1000}s | Model: ${CONFIG.llmModel} | Timeout: ${CONFIG.llmTimeout / 1000}s | Retries: ${CONFIG.maxRetries}`);
 
   process.on('SIGINT', () => { log('SHUTDOWN'); saveState(state); process.exit(0); });
   process.on('SIGTERM', () => { log('SHUTDOWN'); saveState(state); process.exit(0); });
