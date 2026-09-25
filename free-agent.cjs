@@ -370,17 +370,146 @@ async function think(prompt) {
   return null;
 }
 
+// === CHAIN QUERY FUNCTIONS (for sandbox) ===
+// These are injected into the exec sandbox so agents can query live chain data
+const chain = {
+  // Get balance of any address
+  async balance(addr) {
+    const d = await httpGet(`${WOC}/address/${addr}/balance`);
+    return { address: addr, confirmed: d.confirmed || 0, unconfirmed: d.unconfirmed || 0 };
+  },
+
+  // Get a transaction by txid
+  async tx(txid) {
+    return await httpGet(`${WOC}/tx/hash/${txid}`);
+  },
+
+  // Get raw tx hex
+  async rawTx(txid) {
+    const raw = await httpGet(`${WOC}/tx/${txid}/hex`);
+    return typeof raw === 'string' ? raw : (raw.hex || raw);
+  },
+
+  // Get transaction history for an address
+  async history(addr, limit = 10) {
+    const d = await httpGet(`${WOC}/address/${addr}/history`);
+    if (!d) return [];
+    const txs = Array.isArray(d) ? d : (d.txs || d.items || []);
+    return txs.slice(0, limit);
+  },
+
+  // Get UTXOs for an address
+  async utxos(addr) {
+    return await httpGet(`${WOC}/address/${addr}/unspent`);
+  },
+
+  // Get current block height
+  async blockHeight() {
+    const d = await httpGet(`${WOC}/chain/info`);
+    return d.blocks || d.height;
+  },
+
+  // Get block info by height
+  async block(height) {
+    return await httpGet(`${WOC}/block/height/${height}`);
+  },
+
+  // Get block header by height
+  async blockHeader(height) {
+    const d = await httpGet(`${WOC}/block/height/${height}`);
+    if (!d) return null;
+    return {
+      hash: d.hash || d.blockhash || null,
+      height: d.height || d['block-height'] || height,
+      prevHash: d.previousblockhash || d.previousblockhash || null,
+      merkleRoot: d.merkleroot || d.merkleRoot || null,
+      time: d.time || d.blocktime || null,
+      txCount: d.nTx || d.txcount || (d.tx ? d.tx.length : null),
+    };
+  },
+
+  // Parse OP_RETURN data from a transaction
+  parseOpReturn(tx) {
+    if (!tx.vout) return null;
+    for (const out of tx.vout) {
+      const asm = out.scriptPubKey?.asm || '';
+      if (!asm.includes('OP_RETURN')) continue;
+      const hex = out.scriptPubKey?.hex;
+      if (!hex) continue;
+      try {
+        const buf = Buffer.from(hex, 'hex');
+        let i = 0;
+        while (i < buf.length) { if (buf[i] === 0x6a) { i++; break; } i++; }
+        const parts = [];
+        while (i < buf.length) {
+          let len = buf[i]; i++;
+          if (len === 0) continue;
+          if (len === 0x4c) { len = buf[i]; i++; }
+          else if (len === 0x4d) { len = buf.readUInt16LE(i); i += 2; }
+          if (i + len > buf.length) break;
+          parts.push(buf.slice(i, i + len).toString('utf8'));
+          i += len;
+        }
+        if (parts.length > 0) return parts;
+      } catch (e) { /* skip */ }
+    }
+    return null;
+  },
+
+  // Extract sender address from a transaction
+  getSender(tx) {
+    if (!tx.vin || !tx.vin[0]) return null;
+    if (tx.vin[0].addr) return tx.vin[0].addr;
+    return null;
+  },
+
+  // Get outputs/value sent to a specific address in a tx
+  getOutputs(tx, addr) {
+    if (!tx.vout) return [];
+    return tx.vout.filter(out => (out.scriptPubKey?.addresses || []).includes(addr))
+      .map(out => ({ value: Math.round((out.value || 0) * 1e8), n: out.n }));
+  },
+};
+
 // === CODE EXECUTION SANDBOX ===
 async function execCode(code, wallet, state) {
-  const timeout = 10000;
+  const timeout = 15000;
+  // Track chain query calls for output
+  const chainResults = [];
+  const chainProxy = new Proxy({}, {
+    get: (_t, prop) => {
+      if (typeof chain[prop] === 'function') {
+        return async (...args) => {
+          try {
+            const r = await chain[prop](...args);
+            chainResults.push({ method: prop, ok: true });
+            return r;
+          } catch (e) {
+            chainResults.push({ method: prop, error: e.message });
+            return null;
+          }
+        };
+      }
+      return chain[prop];
+    }
+  });
+
   const sandbox = {
     Buffer,
     bsv,
-    console: { log: (...args) => args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') },
+    chain: chainProxy,
+    crypto: require('crypto'),
+    console: { 
+      log: (...args) => args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' '),
+      error: (...args) => args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' '),
+      warn: (...args) => args.map(a => String(a)).join(' '),
+      info: (...args) => args.map(a => String(a)).join(' '),
+    },
     Math, JSON, Date, parseInt, parseFloat, String, Number, Boolean, Array, Object,
     require: (mod) => {
       if (mod === 'crypto') return require('crypto');
       if (mod === 'bsv') return bsv;
+      if (mod === 'chain') return chainProxy;
       if (mod === 'fs') {
         return {
           readFileSync: (p) => fs.readFileSync(path.join(AGENT_DIR, p), 'utf8'),
@@ -395,11 +524,22 @@ async function execCode(code, wallet, state) {
   };
 
   try {
-    const script = new vm.Script(code, { timeout });
+    // Wrap code in async IIFE to support top-level await
+    const wrappedCode = `(async () => { ${code} })();`;
+    const script = new vm.Script(wrappedCode, { timeout: 60000 });
     const context = vm.createContext(sandbox);
-    const result = script.runInContext(context, { timeout });
+    const result = script.runInContext(context, { timeout: 60000 });
     const finalResult = (result && typeof result.then === 'function') ? await result : result;
-    return { success: true, output: typeof finalResult === 'object' ? JSON.stringify(finalResult, null, 2) : String(finalResult) };
+    // Include chain query log if present
+    let output = typeof finalResult === 'object' ? JSON.stringify(finalResult, null, 2) : String(finalResult);
+    if (output === 'undefined' && chainResults.length > 0) {
+      // If no explicit return but chain queries were made, show the query log
+      output = 'Chain queries made: ' + chainResults.map(r => `${r.method}()${r.error ? ' ERR:' + r.error : ''}`).join(', ');
+    } else if (chainResults.length > 0) {
+      // Append chain query summary at the end
+      output += '\n[Chain queries: ' + chainResults.map(r => r.method + (r.error ? '!' : '')).join(', ') + ']';
+    }
+    return { success: true, output: output.substring(0, 1000) };
   } catch (e) {
     return { success: false, error: e.message };
   }
@@ -501,10 +641,35 @@ Commands:
 - pay <N> <sats> <note>  (send sats with note to agent N)
 - broadcast <text>       (put data on-chain, no recipient)
 - note <text>            (save to your memory)
-- exec <js code>         (run JS: crypto, bsv, Buffer, fs, Math, JSON)
+- exec <js code>         (run JS, see output next loop)
 - wait                   (do nothing)
 
-Respond with ONLY the command line. Example: message 1 Let me verify your hash`;
+Exec sandbox has access to:
+- crypto: SHA-256, hashing, random bytes
+- bsv: BSV library (keys, addresses, scripts, transactions)
+- chain: LIVE BLOCKCHAIN DATA via WhatsOnChain API (async, use await)
+- Buffer, Math, JSON, Date, require('fs') for files in your dir
+
+Chain query functions (async, await them):
+- chain.balance(addr)          -> {address, confirmed, unconfirmed}
+- chain.tx(txid)               -> full transaction object
+- chain.rawTx(txid)            -> raw hex string
+- chain.history(addr, limit)   -> recent txs for address (default 10)
+- chain.utxos(addr)            -> unspent outputs
+- chain.blockHeight()          -> current tip height
+- chain.block(height)          -> block info
+- chain.blockHeader(height)    -> block header
+- chain.parseOpReturn(tx)      -> OP_RETURN data array from tx
+- chain.getSender(tx)          -> sender address from tx
+- chain.getOutputs(tx, addr)   -> outputs sent to addr in that tx
+
+USE chain functions to query REAL blockchain data. Don't use placeholder hashes — look up real transactions, verify real data, deliver real services.
+
+Example: exec const tip = await chain.blockHeight(); tip;
+Example: exec const tx = await chain.tx('d0ef96ba417631626cfa62053e338422cb788d62945c7ac20dd7237f2bf9809a'); chain.parseOpReturn(tx);
+Example: exec const bal = await chain.balance('${knownAddrsList[0] || '13h5H3LSwxJu12J3hu3dQQFQCsrxDMXpsM'}'); bal;
+
+Respond with ONLY the command line.`;
 
   const response = await think(prompt);
 
